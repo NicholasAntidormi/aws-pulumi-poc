@@ -1,5 +1,4 @@
 import { createHash } from "crypto";
-import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 import * as apigateway from "@pulumi/aws-apigateway";
 import {
@@ -7,11 +6,18 @@ import {
 	CognitoIdentityClientConfig,
 	GetOpenIdTokenForDeveloperIdentityCommand,
 	GetOpenIdTokenForDeveloperIdentityCommandInput,
-	GetCredentialsForIdentityCommand,
-	GetCredentialsForIdentityCommandInput,
-	DeleteIdentitiesCommand,
-	DeleteIdentitiesCommandInput
 } from "@aws-sdk/client-cognito-identity";
+import {
+	DynamoDBClient,
+	DynamoDBClientConfig,
+	PutItemCommand,
+	PutItemCommandInput,
+	GetItemCommand,
+	GetItemCommandInput,
+	DeleteItemCommand,
+	DeleteItemCommandInput,
+} from "@aws-sdk/client-dynamodb";
+import { createRemoteJWKSet , jwtVerify } from 'jose'
 
 const getBody = (ev: any) =>
 	!ev.body
@@ -20,10 +26,12 @@ const getBody = (ev: any) =>
 			? JSON.parse(Buffer.from(ev.body, 'base64').toString('utf8'))
 			: JSON.parse(ev.body)
 
-const developerProviderName = "developer-provider"
+// Identity Pool
 const cognitoIdentityClientConfig: CognitoIdentityClientConfig = {
 	region: "us-east-1"
 }
+
+const developerProviderName = "developer-provider"
 
 const identityPool = new aws.cognito.IdentityPool("identity-pool", {
 	identityPoolName: "identity-pool",
@@ -118,23 +126,34 @@ const unauthenticatedRolePolicy = new aws.iam.RolePolicy("unauthenticatedRolePol
 
 const identityPoolRoleAttachment = new aws.cognito.IdentityPoolRoleAttachment("identityPoolRoleAttachment", {
 	identityPoolId: identityPool.id,
-	// roleMappings: [{
-	//       identityProvider: "graph.facebook.com",
-	//     ambiguousRoleResolution: "AuthenticatedRole",
-	//     type: "Rules",
-	//     mappingRules: [{
-	//         claim: "isAdmin",
-	//         matchType: "Equals",
-	//         roleArn: authenticatedRole.arn,
-	//         value: "paid",
-	//     }],
-	// }],
 	roles: {
 		authenticated: authenticatedRole.arn,
 		unauthenticated: unauthenticatedRole.arn,
 	},
 });
 
+// DynamoDB
+const dynamoDBClientConfig: DynamoDBClientConfig = {
+	region: "us-east-1"
+}
+
+const dynamodbSessionsTable = new aws.dynamodb.Table("dynamodbSessionsTable", {
+	attributes: [
+		{
+			name: "UserId",
+			type: "S",
+		},
+		{
+			name: "DeviceId",
+			type: "S",
+		},
+	],
+	hashKey: "UserId",
+	rangeKey: "DeviceId",
+	billingMode: "PAY_PER_REQUEST"
+})
+
+// Functions
 const helloWorld = new aws.lambda.CallbackFunction("helloWorld", {
 	callback: async (ev, ctx) => ({
 		statusCode: 200,
@@ -145,28 +164,45 @@ const helloWorld = new aws.lambda.CallbackFunction("helloWorld", {
 const login = new aws.lambda.CallbackFunction("login", {
 	callback: async (ev: any, ctx) => {
 		const body = getBody(ev)
+		// TODO: distinguish non silent/silent login
+		// TODO: deviceId
+		const deviceId = 'deviceId'
 		const { username, password } = body || {}
 
 		if (!username || !password) return { statusCode: 400, body: "Missing username or password" }
 
 		// TODO: verify credentials
 
+		const usernameHash = createHash('md5').update(username).digest("hex")
+
 		const input: GetOpenIdTokenForDeveloperIdentityCommandInput = {
 			IdentityPoolId: identityPool.id.get(),
 			Logins: {
-				[developerProviderName]: createHash('md5').update(username).digest("hex")
+				[developerProviderName]: usernameHash
 			},
 			TokenDuration: 60 * 60
 		}
 		const client = new CognitoIdentityClient(cognitoIdentityClientConfig);
 		const command = new GetOpenIdTokenForDeveloperIdentityCommand(input);
-		const { Token, IdentityId } = await client.send(command);
+		const { Token } = await client.send(command);
+
+		if (!Token) return { statusCode: 500, body: "Error creating Token" }
+
+		const dynamoInput: PutItemCommandInput = {
+			TableName: dynamodbSessionsTable.name.get(),
+			Item: {
+				UserId: { S: usernameHash },
+				DeviceId: { S: deviceId }
+			}
+		}
+		const dynamoDBClient = new DynamoDBClient(dynamoDBClientConfig);
+		const dynamoCommand = new PutItemCommand(dynamoInput);
+		await dynamoDBClient.send(dynamoCommand);
 
 		return {
 			statusCode: 200,
 			body: JSON.stringify({
 				Token,
-				IdentityId
 			})
 		};
 	},
@@ -174,28 +210,41 @@ const login = new aws.lambda.CallbackFunction("login", {
 
 const authorize = new aws.lambda.CallbackFunction("authorize", {
 	callback: async (ev: any, ctx) => {
-		const { IdentityId, Token } = ev.headers || {}
+		// TODO: deviceId
+		const deviceId = 'deviceId'
+		const { Token } = ev.headers || {}
 
-		if (!IdentityId || !Token) return { statusCode: 400, body: "Missing username or password" }
+		if (!Token) return { statusCode: 400, body: "Missing Token" }
 
 		let effect = "Deny"
 
-		if (IdentityId && Token) {
-			const input: GetCredentialsForIdentityCommandInput = {
-				IdentityId,
-				Logins: {
-					"cognito-identity.amazonaws.com": Token
+		try {
+			const JWKS = createRemoteJWKSet(new URL("https://cognito-identity.amazonaws.com/.well-known/jwks_uri"))
+			const jwtOptions = {
+				issuer: "https://cognito-identity.amazonaws.com", // set this to the expected "iss" claim on your JWTs
+				audience: "us-east-1:5e6212d7-b907-4b6b-9b78-3cf761ff209f", // set this to the expected "aud" claim on your JWTs
+			}
+			const { payload: verifiedToken } = await jwtVerify(Token, JWKS, jwtOptions)
+			const userId = (verifiedToken as any).amr[2].split(':')[3]
+
+			const dynamoInput: GetItemCommandInput = {
+				TableName: dynamodbSessionsTable.name.get(),
+				Key: {
+					UserId: { S: userId },
+					DeviceId: { S: deviceId },
 				}
 			}
+			const dynamoDBClient = new DynamoDBClient(dynamoDBClientConfig);
+			const dynamoCommand = new GetItemCommand(dynamoInput);
+			const { Item } = await dynamoDBClient.send(dynamoCommand);
 
-			const client = new CognitoIdentityClient(cognitoIdentityClientConfig);
-			const command = new GetCredentialsForIdentityCommand(input);
-			try {
-				await client.send(command);
+			if (Item && Item.DeviceId.S === deviceId) {
 				effect = "Allow"
-			} catch (err) {
+			} else {
 				effect = "Deny"
 			}
+		} catch (err) {
+			effect = "Deny"
 		}
 
 		return {
@@ -216,17 +265,34 @@ const authorize = new aws.lambda.CallbackFunction("authorize", {
 
 const logout = new aws.lambda.CallbackFunction("logout", {
 	callback: async (ev: any, ctx) => {
-		const { IdentityId } = ev.headers || {}
+		// TODO: deviceId
+		const deviceId = 'deviceId'
+		const { Token } = ev.headers || {}
 
-		if (!IdentityId) return { statusCode: 400, body: "Missing identity id" }
+		if (!Token) return { statusCode: 400, body: "Missing Token" }
 
-		const input: DeleteIdentitiesCommandInput = {
-			IdentityIdsToDelete: [IdentityId]
+		const JWKS = createRemoteJWKSet(new URL("https://cognito-identity.amazonaws.com/.well-known/jwks_uri"))
+		const jwtOptions = {
+			issuer: "https://cognito-identity.amazonaws.com", // set this to the expected "iss" claim on your JWTs
+			audience: "us-east-1:5e6212d7-b907-4b6b-9b78-3cf761ff209f", // set this to the expected "aud" claim on your JWTs
 		}
+		const { payload: verifiedToken } = await jwtVerify(Token, JWKS, jwtOptions)
+		const userId = (verifiedToken as any).amr[2].split(':')[3]
 
-		const client = new CognitoIdentityClient(cognitoIdentityClientConfig);
-		const command = new DeleteIdentitiesCommand(input);
-		const response = await client.send(command);
+		const input: DeleteItemCommandInput = {
+			TableName: dynamodbSessionsTable.name.get(),
+			Key: {
+				UserId: {
+					S: userId
+				},
+				DeviceId: {
+					S: deviceId
+				}
+			}
+		}
+		const client = new DynamoDBClient(dynamoDBClientConfig);
+		const command = new DeleteItemCommand(input);
+		await client.send(command);
 
 		return {
 			statusCode: 200,
@@ -234,17 +300,18 @@ const logout = new aws.lambda.CallbackFunction("logout", {
 	},
 });
 
+// Gateway
 const api = new apigateway.RestAPI("api", {
 	routes: [
-		{
-			path: "/login",
-			method: "POST",
-			eventHandler: login,
-		},
 		{
 			path: "/hello-world",
 			method: "GET",
 			eventHandler: helloWorld,
+		},
+		{
+			path: "/login",
+			method: "POST",
+			eventHandler: login,
 		},
 		{
 			path: "/authorized/hello-world",
@@ -255,7 +322,7 @@ const api = new apigateway.RestAPI("api", {
 					authType: "custom",
 					parameterName: "Token",
 					type: "request",
-					identitySource: ["method.request.header.Token", "method.request.header.IdentityId"],
+					identitySource: ["method.request.header.Token"],
 					handler: authorize,
 				},
 			],
@@ -269,7 +336,7 @@ const api = new apigateway.RestAPI("api", {
 					authType: "custom",
 					parameterName: "Token",
 					type: "request",
-					identitySource: ["method.request.header.Token", "method.request.header.IdentityId"],
+					identitySource: ["method.request.header.Token"],
 					handler: authorize,
 				},
 			],

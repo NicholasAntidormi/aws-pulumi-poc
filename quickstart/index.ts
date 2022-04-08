@@ -17,7 +17,7 @@ import {
 	DeleteItemCommand,
 	DeleteItemCommandInput,
 } from "@aws-sdk/client-dynamodb";
-import { createRemoteJWKSet , jwtVerify } from 'jose'
+import { createRemoteJWKSet , jwtVerify, decodeJwt } from 'jose'
 
 const getBody = (ev: any) =>
 	!ev.body
@@ -143,13 +143,8 @@ const dynamodbSessionsTable = new aws.dynamodb.Table("dynamodbSessionsTable", {
 			name: "UserId",
 			type: "S",
 		},
-		{
-			name: "DeviceId",
-			type: "S",
-		},
 	],
 	hashKey: "UserId",
-	rangeKey: "DeviceId",
 	billingMode: "PAY_PER_REQUEST"
 })
 
@@ -165,11 +160,10 @@ const login = new aws.lambda.CallbackFunction("login", {
 	callback: async (ev: any, ctx) => {
 		const body = getBody(ev)
 		// TODO: distinguish non silent/silent login
-		// TODO: deviceId
-		const deviceId = 'deviceId'
+		const { DeviceId } = ev.headers || {}
 		const { username, password } = body || {}
 
-		if (!username || !password) return { statusCode: 400, body: "Missing username or password" }
+		if (!DeviceId || !username || !password) return { statusCode: 400, body: "Missing DeviceId, username or password" }
 
 		// TODO: verify credentials
 
@@ -192,8 +186,8 @@ const login = new aws.lambda.CallbackFunction("login", {
 			TableName: dynamodbSessionsTable.name.get(),
 			Item: {
 				UserId: { S: usernameHash },
-				DeviceId: { S: deviceId }
-			}
+				DeviceId: { S: DeviceId },
+			},
 		}
 		const dynamoDBClient = new DynamoDBClient(dynamoDBClientConfig);
 		const dynamoCommand = new PutItemCommand(dynamoInput);
@@ -210,38 +204,47 @@ const login = new aws.lambda.CallbackFunction("login", {
 
 const authorize = new aws.lambda.CallbackFunction("authorize", {
 	callback: async (ev: any, ctx) => {
-		// TODO: deviceId
-		const deviceId = 'deviceId'
-		const { Token } = ev.headers || {}
-
-		if (!Token) return { statusCode: 400, body: "Missing Token" }
+		const { Token, DeviceId } = ev.headers || {}
 
 		let effect = "Deny"
+
+		if (!Token || !DeviceId) {
+			return {
+				principalId: "my-user",
+				policyDocument: {
+					Version: "2012-10-17",
+					Statement: [
+						{
+							Action: "execute-api:Invoke",
+							Effect: effect,
+							Resource: ev.methodArn,
+						},
+					],
+				}
+			}
+		}
 
 		try {
 			const JWKS = createRemoteJWKSet(new URL("https://cognito-identity.amazonaws.com/.well-known/jwks_uri"))
 			const jwtOptions = {
 				issuer: "https://cognito-identity.amazonaws.com", // set this to the expected "iss" claim on your JWTs
-				audience: "us-east-1:5e6212d7-b907-4b6b-9b78-3cf761ff209f", // set this to the expected "aud" claim on your JWTs
+				audience: identityPool.id.get(), // set this to the expected "aud" claim on your JWTs
 			}
 			const { payload: verifiedToken } = await jwtVerify(Token, JWKS, jwtOptions)
-			const userId = (verifiedToken as any).amr[2].split(':')[3]
+			const userId = (verifiedToken.amr as any)[2].split(':')[3]
 
 			const dynamoInput: GetItemCommandInput = {
 				TableName: dynamodbSessionsTable.name.get(),
 				Key: {
 					UserId: { S: userId },
-					DeviceId: { S: deviceId },
 				}
 			}
 			const dynamoDBClient = new DynamoDBClient(dynamoDBClientConfig);
 			const dynamoCommand = new GetItemCommand(dynamoInput);
 			const { Item } = await dynamoDBClient.send(dynamoCommand);
 
-			if (Item && Item.DeviceId.S === deviceId) {
+			if (Item && Item.DeviceId.S === DeviceId) {
 				effect = "Allow"
-			} else {
-				effect = "Deny"
 			}
 		} catch (err) {
 			effect = "Deny"
@@ -265,19 +268,12 @@ const authorize = new aws.lambda.CallbackFunction("authorize", {
 
 const logout = new aws.lambda.CallbackFunction("logout", {
 	callback: async (ev: any, ctx) => {
-		// TODO: deviceId
-		const deviceId = 'deviceId'
-		const { Token } = ev.headers || {}
+		const { Token , DeviceId} = ev.headers || {}
 
-		if (!Token) return { statusCode: 400, body: "Missing Token" }
+		if (!Token || !DeviceId) return { statusCode: 400, body: "Missing Token or DeviceId" }
 
-		const JWKS = createRemoteJWKSet(new URL("https://cognito-identity.amazonaws.com/.well-known/jwks_uri"))
-		const jwtOptions = {
-			issuer: "https://cognito-identity.amazonaws.com", // set this to the expected "iss" claim on your JWTs
-			audience: "us-east-1:5e6212d7-b907-4b6b-9b78-3cf761ff209f", // set this to the expected "aud" claim on your JWTs
-		}
-		const { payload: verifiedToken } = await jwtVerify(Token, JWKS, jwtOptions)
-		const userId = (verifiedToken as any).amr[2].split(':')[3]
+		const payload = decodeJwt(Token)
+		const userId = (payload.amr as any)[2].split(':')[3]
 
 		const input: DeleteItemCommandInput = {
 			TableName: dynamodbSessionsTable.name.get(),
@@ -285,9 +281,6 @@ const logout = new aws.lambda.CallbackFunction("logout", {
 				UserId: {
 					S: userId
 				},
-				DeviceId: {
-					S: deviceId
-				}
 			}
 		}
 		const client = new DynamoDBClient(dynamoDBClientConfig);
@@ -296,6 +289,7 @@ const logout = new aws.lambda.CallbackFunction("logout", {
 
 		return {
 			statusCode: 200,
+			body: "Logged out"
 		};
 	},
 });

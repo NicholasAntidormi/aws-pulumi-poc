@@ -17,7 +17,7 @@ import {
 	DeleteItemCommand,
 	DeleteItemCommandInput,
 } from "@aws-sdk/client-dynamodb";
-import { createRemoteJWKSet , jwtVerify, decodeJwt } from 'jose'
+import { createRemoteJWKSet, jwtVerify, decodeJwt } from 'jose'
 
 const getBody = (ev: any) =>
 	!ev.body
@@ -145,8 +145,52 @@ const dynamodbSessionsTable = new aws.dynamodb.Table("dynamodbSessionsTable", {
 		},
 	],
 	hashKey: "UserId",
-	billingMode: "PAY_PER_REQUEST"
+	billingMode: "PAY_PER_REQUEST",
+	streamEnabled: true,
+	streamViewType: "NEW_IMAGE",
 })
+
+const dynamodbSavedSessionsTable = new aws.dynamodb.Table("dynamodbSavedSessionsTable", {
+	attributes: [
+		{
+			name: "UserId",
+			type: "S",
+		},
+		{
+			name: "Timestamp",
+			type: "N",
+		},
+	],
+	hashKey: "UserId",
+	rangeKey: "Timestamp",
+	billingMode: "PAY_PER_REQUEST",
+})
+
+const saveSession = new aws.lambda.CallbackFunction("saveSession", {
+	callback: async (ev: any, ctx, cb) => {
+		await Promise.all(ev.Records.map(async (record: any) => {
+			if (record.eventName == 'INSERT' || record.eventName == 'MODIFY') {
+				const dynamoInput: PutItemCommandInput = {
+					TableName: dynamodbSavedSessionsTable.name.get(),
+					Item: {
+						...record.dynamodb.NewImage,
+						Timestamp: { N: `${Math.floor(Date.now() / 1000)}` },
+					},
+				}
+				const dynamoDBClient = new DynamoDBClient(dynamoDBClientConfig);
+				const dynamoCommand = new PutItemCommand(dynamoInput);
+				await dynamoDBClient.send(dynamoCommand);
+			}
+		}))
+		cb(null, `Successfully processed ${ev.Records.length} records.`);
+	}
+});
+
+const eventSourceMapping = new aws.lambda.EventSourceMapping("example", {
+	eventSourceArn: dynamodbSessionsTable.streamArn,
+	functionName: saveSession.arn,
+	startingPosition: "LATEST",
+});
 
 // Functions
 const helloWorld = new aws.lambda.CallbackFunction("helloWorld", {
@@ -268,7 +312,7 @@ const authorize = new aws.lambda.CallbackFunction("authorize", {
 
 const logout = new aws.lambda.CallbackFunction("logout", {
 	callback: async (ev: any, ctx) => {
-		const { Token , DeviceId} = ev.headers || {}
+		const { Token, DeviceId } = ev.headers || {}
 
 		if (!Token || !DeviceId) return { statusCode: 400, body: "Missing Token or DeviceId" }
 
